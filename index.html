@@ -65,7 +65,7 @@ async function waitFor(name, ms = 9000){
 async function apiComplete(prompt, useSearch){
   const body = {
     model: "claude-sonnet-4-6",
-    max_tokens: useSearch ? 4000 : 2000,
+    max_tokens: useSearch ? 4000 : 3000,
     messages: [{ role: "user", content: prompt }]
   };
   if (useSearch) body.tools = [{ type: "web_search_20250305", name: "web_search" }];
@@ -155,6 +155,64 @@ function localScan(text){
 
 const TYPE_LABELS = {'1':'①산업안전','2':'②정치·이념','3':'③젠더·혐오','4':'④차별·소수자','5':'⑤역사·외교'};
 
+/* 긴 내용을 문장 경계 기준으로 구간 분할 (전체를 빠짐없이 검증하기 위함) */
+function chunkText(text, size){
+  const t = String(text || '');
+  const out = [];
+  let i = 0;
+  while (i < t.length){
+    let end = Math.min(i + size, t.length);
+    if (end < t.length){
+      const seg = t.slice(i, end);
+      const b = Math.max(seg.lastIndexOf('\n'), seg.lastIndexOf('. '), seg.lastIndexOf('。'), seg.lastIndexOf('! '), seg.lastIndexOf('? '), seg.lastIndexOf('니다.'));
+      if (b > size * 0.5) end = i + b + 1;
+    }
+    out.push(t.slice(i, end));
+    i = end;
+  }
+  return out.length ? out : [''];
+}
+
+/* 여러 구간(로컬+AI 청크)의 분석 결과를 병합 — 항목별로 가장 엄격한 판정을 채택 */
+function mergeResults(results){
+  const keys = ['1-1','1-2','1-3','2-1','2-2','2-3','3-1','3-2','3-3'];
+  const sev = { '적합':0, '권고':1, '수정필요':2 };
+  const riskRank = { '낮음':0, '중간':1, '높음':2 };
+  const bestA = {}, notes = {}, specials = [], flags = [], seenQ = new Set();
+  let maxRisk = 0, hasNonNA = false;
+  for (const r of results){
+    if (!r) continue;
+    (r.flags || []).forEach(f => {
+      if (f && f.q){ const key = String(f.q).trim(); if (key && !seenQ.has(key)){ seenQ.add(key); flags.push(f); } }
+    });
+    const cl = r.checklist || {};
+    keys.forEach(k => {
+      const c = cl[k]; if (!c) return;
+      const a = String(c.a || '').trim();
+      if (a && a !== 'NA'){
+        hasNonNA = true;
+        const rank = sev[a] != null ? sev[a] : 0;
+        const cur = (bestA[k] && bestA[k] !== 'NA') ? (sev[bestA[k]] || 0) : -1;
+        if (rank > cur) bestA[k] = a;
+      } else if (!(k in bestA)) bestA[k] = 'NA';
+      if (c.note){ (notes[k] = notes[k] || []); if (!notes[k].includes(c.note)) notes[k].push(c.note); }
+    });
+    if (r.special) specials.push(r.special);
+    if (r.risk && riskRank[r.risk] != null) maxRisk = Math.max(maxRisk, riskRank[r.risk]);
+  }
+  const checklist = {};
+  keys.forEach(k => {
+    const a = bestA[k] || (k.indexOf('2-') === 0 ? 'NA' : '적합');
+    checklist[k] = { a, note: (notes[k] || []).join(' / ') };
+  });
+  return {
+    flags,
+    checklist,
+    special: Array.from(new Set(specials)).join(' '),
+    risk: hasNonNA ? ['낮음','중간','높음'][maxRisk] : ''
+  };
+}
+
 const INITIAL_ITEMS = [
   { id:'s1q1', sec:1, secTitle:'1. 언어적 표현 검증', no:1, title:'밈/신조어 유래 확인', q:'사용된 유행어·신조어·숏폼 소스가 특정 커뮤니티, 혐오, 조롱, 비하, 정치적 맥락으로 변질된 표현이 아닌가?', visual:false, answer:null, reason:'', byAI:false },
   { id:'s1q2', sec:1, secTitle:'1. 언어적 표현 검증', no:2, title:'부정적 다의성 스크리닝', q:'문구 안에 성별·연령·장애·외모·인종·종교·성향·정치·지역 등 특정 집단을 폄하하거나 배제하는 표현이 없는가?', visual:false, answer:null, reason:'', byAI:false },
@@ -226,7 +284,7 @@ function App(){
     try { pdfjs.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js'; } catch(e){}
     const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
     const out = [];
-    const max = Math.min(pdf.numPages, 40);
+    const max = Math.min(pdf.numPages, 300);
     for (let i=1;i<=max;i++){
       const page = await pdf.getPage(i);
       const tc = await page.getTextContent();
@@ -443,19 +501,34 @@ function App(){
       return;
     }
 
-    // 1) 로컬 키워드 자동 점검 — 즉시 체크리스트를 채운다(환경 무관).
-    applyAI(localScan(localText));
+    // 1) 로컬 키워드 자동 점검 — 전체 텍스트를 즉시 점검(환경 무관).
+    const localResult = localScan(localText);
+    applyAI(localResult);
 
-    // 2) AI 정밀 분석이 가능하면 더 정확한 판정으로 덮어쓴다.
-    setState({ scanning: true, scanStage: 'AI가 가이드 기준으로 정밀 분석 중…' });
-    try {
-      const raw = await aiComplete(buildPrompt(localText.slice(0, 7000)));
-      applyAI(parseJson(raw));
-      setState({ scanning: false });
-    } catch(e){
-      // AI 불가: 위에서 로컬 자동 점검 결과가 이미 체크리스트에 반영됨.
-      setState({ scanning: false, aiError: '정밀 AI 분석은 현재 환경에서 사용할 수 없어, 키워드 기반 자동 점검 결과를 표시했습니다. 항목을 확인·보정해 주세요. (정밀 분석은 Claude 환경에서 동작)' });
+    // 2) AI 정밀 분석 — 길이에 상관없이 전체를 구간으로 나눠 빠짐없이 검증 후 병합.
+    const CHUNK = 6000;      // 구간 크기(자)
+    const MAX_CHUNKS = 20;   // 최대 구간 수 (~120,000자)
+    const allChunks = chunkText(localText, CHUNK);
+    const chunks = allChunks.slice(0, MAX_CHUNKS);
+    setState({ scanning: true, scanStage: chunks.length > 1 ? ('AI가 전체 내용을 ' + chunks.length + '개 구간으로 정밀 분석 중…') : 'AI가 가이드 기준으로 정밀 분석 중…' });
+
+    const parts = [localResult];  // 로컬(전체) 결과를 기본 포함 → AI 실패 구간도 누락되지 않음
+    let anyFail = false;
+    for (let ci = 0; ci < chunks.length; ci++){
+      if (chunks.length > 1) setState({ scanStage: 'AI 정밀 분석 중… (' + (ci + 1) + '/' + chunks.length + ' 구간)' });
+      try {
+        const raw = await aiComplete(buildPrompt(chunks[ci]));
+        parts.push(parseJson(raw));
+      } catch(err){ anyFail = true; }
     }
+
+    applyAI(mergeResults(parts));
+    const anyOk = parts.length > 1;
+    let note = '';
+    if (!anyOk) note = '정밀 AI 분석은 현재 환경에서 사용할 수 없어, 키워드 기반 자동 점검 결과(전체 내용 적용)를 표시했습니다. 항목을 확인·보정해 주세요.';
+    else if (allChunks.length > MAX_CHUNKS) note = '내용이 매우 길어 앞부분 약 ' + (MAX_CHUNKS * CHUNK).toLocaleString() + '자까지 AI 정밀 분석했습니다. (키워드 자동 점검은 전체에 적용됨)';
+    else if (anyFail) note = '일부 구간의 AI 분석에 실패해 키워드 자동 점검 결과와 병합했습니다.';
+    setState({ scanning: false, aiError: note });
   };
 
   const confirm = () => setState({ confirmed: true });
@@ -522,7 +595,7 @@ function App(){
       + '<h2 style="font-size:13pt;color:#0f2950;border-bottom:2px solid #0f2950;padding-bottom:3px;margin-top:18px;">3. 특이사항</h2>'
       + '<p style="font-size:10.5pt;line-height:1.6;">' + (E(s.special || '-').replace(/\n/g,'<br>')) + '</p>'
       + '<h2 style="font-size:13pt;color:#0f2950;border-bottom:2px solid #0f2950;padding-bottom:3px;margin-top:18px;">4. 분석 대상 텍스트</h2>'
-      + '<p style="font-size:9.5pt;line-height:1.6;color:#444;">' + (E(analyzed.slice(0, 6000)).replace(/\n/g,'<br>') || '-') + (analyzed.length > 6000 ? '<br>… (이하 생략)' : '') + '</p>';
+      + '<p style="font-size:9.5pt;line-height:1.6;color:#444;">' + (E(analyzed.slice(0, 100000)).replace(/\n/g,'<br>') || '-') + (analyzed.length > 100000 ? '<br>… (이하 생략)' : '') + '</p>';
 
     const html = '<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">'
       + '<head><meta charset="utf-8"><title>콘텐츠 사전 점검 리포트</title>'
@@ -592,36 +665,36 @@ function App(){
     + (confirmable ? 'background:#fff;color:#0f2950;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.15);' : 'background:rgba(255,255,255,.25);color:#cdddf2;cursor:not-allowed;');
 
   const fullText = ((s.extractedText || '') + (s.urlText ? '\n' + s.urlText : '') + (s.pastedText ? '\n' + s.pastedText : '')).trim();
-  // 권고·수정이 필요한 "구간"만 추출 (해당 문구가 포함된 문장 단위 + 문구 강조)
-  const contextOf = (text, q) => {
-    const i = text.indexOf(q);
-    if (i < 0) return q;
-    const isB = (ch) => ch==='\n' || ch==='.' || ch==='。' || ch==='!' || ch==='?' || ch==='…';
-    let start = i, end = i + q.length;
-    while (start > 0 && (i - start) < 70 && !isB(text[start-1])) start--;
-    while (end < text.length && (end - (i + q.length)) < 70 && !isB(text[end])) end++;
-    return text.slice(start, end).trim();
-  };
-  const highlightInSeg = (seg, q, lvl) => {
-    let h = esc(seg);
-    const qEsc = esc(String(q));
-    const markStyle = lvl === 'rec'
-      ? 'background:#fff3df;color:#9a6a00;border-bottom:2px solid #e0a32e;border-radius:2px;padding:0 2px;font-weight:700;'
-      : 'background:#ffe2de;color:#b42318;border-bottom:2px solid #d92d20;border-radius:2px;padding:0 2px;font-weight:700;';
-    try {
-      const pat = qEsc.split(/\s+/).map(escRe).join('\\s+');
-      h = h.replace(new RegExp(pat,'g'), '<mark style="'+markStyle+'">$&</mark>');
-    } catch(e){}
-    return h.replace(/\n/g,' ');
-  };
-  const reviewSegments = (s.flags || [])
+
+  // 첨부한 "전체 내용"을 그대로 표기하고, 권고(주황)·수정(빨강) 구간만 색으로 강조.
+  const DISPLAY_CAP = 200000;
+  const flagList = (s.flags || [])
     .filter(f => f && f.q)
-    .map(f => {
-      const q = String(f.q).replace(/^["'“”‘’\s]+|["'“”‘’\s]+$/g,'');
-      const lvl = normLevel(f.level);
-      return { q, lvl, type: String(f.type), reason: f.reason || '', segHtml: highlightInSeg(contextOf(fullText, q), q, lvl) };
-    })
+    .map(f => ({ q: String(f.q).replace(/^["'“”‘’\s]+|["'“”‘’\s]+$/g,''), lvl: normLevel(f.level), type: String(f.type), reason: f.reason || '' }))
     .filter(f => f.q);
+
+  let fullHtml = '';
+  if (fullText){
+    let html = esc(fullText.slice(0, DISPLAY_CAP));
+    // 긴 문구부터 치환해 부분 겹침 방지
+    const ordered = [...flagList].sort((a,b) => b.q.length - a.q.length);
+    for (const f of ordered){
+      const markStyle = f.lvl === 'rec'
+        ? 'background:#fff3df;color:#8a5d00;border-bottom:2px solid #e0a32e;border-radius:2px;padding:0 2px;font-weight:700;cursor:help;'
+        : 'background:#ffe2de;color:#a02018;border-bottom:2px solid #d92d20;border-radius:2px;padding:0 2px;font-weight:700;cursor:help;';
+      const qEsc = esc(f.q);
+      const title = String(f.reason || '').replace(/"/g,'&quot;');
+      try {
+        const pat = qEsc.split(/\s+/).map(escRe).join('\\s+'); // 띄어쓰기·줄바꿈 차이 허용
+        // 이미 감싼 <mark> 안은 다시 치환하지 않도록 mark 태그가 없는 구간에서만 치환
+        html = html.replace(new RegExp('(' + pat + ')(?![^<]*</mark>)', 'g'),
+          '<mark style="' + markStyle + '" title="' + title + '">$1</mark>');
+      } catch(e){}
+    }
+    fullHtml = html.replace(/\n/g, '<br>');
+  }
+  const recFlagCount = flagList.filter(f => f.lvl === 'rec').length;
+  const noFlagCount = flagList.filter(f => f.lvl === 'no').length;
 
   const riskLabel = s.risk ? ('종합 리스크: ' + s.risk) : '체크리스트 외 확인 필요 사항';
   const riskColor = s.risk === '높음' ? 'background:#fde7e4;color:#b42318;' : s.risk === '중간' ? 'background:#fff3df;color:#9a6a00;' : s.risk === '낮음' ? 'background:#e6f6ec;color:#0f7b4f;' : 'background:#eef1f6;color:#5b6577;';
@@ -700,44 +773,56 @@ function App(){
         {/* Panel A: text */}
         <div style={css('background:#fff; border:1px solid #dde3ec; border-radius:12px; overflow:hidden; box-shadow:0 1px 3px rgba(16,24,40,.04);')}>
           <div style={css('background:#f5f7fa; border-bottom:1px solid #e6eaf1; padding:11px 16px; font-size:13px; font-weight:700; color:#324158; display:flex; justify-content:space-between; align-items:center;')}>
-            <span>권고·수정이 필요한 구간</span>
-            <span style={css('font-size:11px; font-weight:500; color:#8a94a6;')}>{s.scanned && !s.scanning && fullText ? (reviewSegments.length + '건') : ''}</span>
+            <span>첨부 내용 전체 · 권고·수정 구간 강조</span>
+            <span style={css('font-size:11px; font-weight:500; color:#8a94a6;')}>{fullText ? (fullText.length.toLocaleString() + '자' + (s.scanned && !s.scanning ? ' · 확인 필요 ' + flagList.length + '건' : '')) : ''}</span>
           </div>
-          <div style={css('padding:18px; min-height:240px; max-height:380px; overflow:auto;')}>
+          <div style={css('padding:18px; min-height:240px; max-height:420px; overflow:auto;')}>
             {s.scanning &&
               <div style={css('display:flex; flex-direction:column; align-items:center; justify-content:center; height:200px; color:#1b4079; gap:12px;')}>
                 <div style={css('width:30px; height:30px; border:3px solid #d6e0ef; border-top-color:#1b4079; border-radius:50%; animation:ccspin .8s linear infinite;')}></div>
                 <div style={css('font-size:13px; font-weight:600;')}>{s.scanStage}</div>
               </div>
             }
-            {!s.scanning && fullText && reviewSegments.length > 0 &&
-              <div style={css('display:flex; flex-direction:column; gap:9px;')}>
-                {reviewSegments.map((seg, idx) => {
-                  const isRecSeg = seg.lvl === 'rec';
-                  return (
-                    <div key={idx} style={css('background:' + (isRecSeg ? '#fffaf0' : '#fef6f5') + '; border:1px solid ' + (isRecSeg ? '#ecd49a' : '#f5cdc8') + '; border-radius:8px; padding:10px 12px;')}>
-                      <div style={css('display:flex; align-items:center; gap:6px; margin-bottom:5px;')}>
-                        <span style={css('font-size:10px;font-weight:800;padding:1px 8px;border-radius:10px;background:' + (isRecSeg ? '#f6e2b8' : '#f7cdc8') + ';color:' + (isRecSeg ? '#8a5d00' : '#a02018') + ';')}>{isRecSeg ? '권고' : '수정'}</span>
-                        <span style={css('font-size:11.5px;font-weight:700;color:' + (isRecSeg ? '#9a6a00' : '#b42318') + ';')}>{typeLabelMap[seg.type] || '확인 필요'}</span>
-                      </div>
-                      <div style={css('font-size:13px; line-height:1.7; color:#2c3a52;')} dangerouslySetInnerHTML={{ __html: '“' + seg.segHtml + '”' }} />
-                      <div style={css('font-size:12px; color:#5b6577; margin-top:5px; line-height:1.5;')}>↳ {seg.reason}</div>
+            {!s.scanning && fullText &&
+              <div>
+                {s.scanned &&
+                  <div style={css('display:flex; align-items:center; gap:8px; margin-bottom:12px; padding-bottom:10px; border-bottom:1px solid #eef1f6; flex-wrap:wrap;')}>
+                    {flagList.length > 0
+                      ? <span style={css('font-size:12px; font-weight:700; color:#324158;')}>전체 내용 검증 완료 — 확인 필요 {flagList.length}건 (권고 {recFlagCount} · 수정 {noFlagCount})</span>
+                      : <span style={css('font-size:12px; font-weight:700; color:#0f7b4f;')}>✓ 전체 내용 검증 완료 — 권고·수정이 필요한 구간 없음</span>}
+                    {flagList.length > 0 &&
+                      <span style={css('display:inline-flex; gap:10px; font-size:11px; color:#8a94a6;')}>
+                        <span style={css('display:inline-flex;align-items:center;gap:4px;')}><span style={css('width:9px;height:9px;border-radius:2px;background:#fff3df;border:1px solid #e0a32e;display:inline-block;')}></span>권고</span>
+                        <span style={css('display:inline-flex;align-items:center;gap:4px;')}><span style={css('width:9px;height:9px;border-radius:2px;background:#ffe2de;border:1px solid #d92d20;display:inline-block;')}></span>수정</span>
+                      </span>}
+                  </div>
+                }
+                <div style={{ fontSize:'13.5px', lineHeight:'1.95', color:'#2c3a52', whiteSpace:'normal' }} dangerouslySetInnerHTML={{ __html: fullHtml }} />
+                {s.scanned && flagList.length > 0 &&
+                  <div style={css('margin-top:16px; border-top:1px dashed #e1e7f0; padding-top:12px;')}>
+                    <div style={css('font-size:12px; font-weight:700; color:#324158; margin-bottom:8px;')}>확인이 필요한 내용 {flagList.length}건</div>
+                    <div style={css('display:flex; flex-direction:column; gap:7px;')}>
+                      {flagList.map((f, idx) => {
+                        const isRec = f.lvl === 'rec';
+                        return (
+                          <div key={idx} style={css('background:' + (isRec ? '#fffaf0' : '#fef6f5') + '; border:1px solid ' + (isRec ? '#ecd49a' : '#f5cdc8') + '; border-radius:7px; padding:8px 11px;')}>
+                            <div style={css('font-size:12.5px; font-weight:700; color:' + (isRec ? '#9a6a00' : '#b42318') + ';')}>
+                              <span style={css('font-size:10px;font-weight:800;padding:1px 7px;border-radius:10px;margin-right:6px;background:' + (isRec ? '#f6e2b8' : '#f7cdc8') + ';color:' + (isRec ? '#8a5d00' : '#a02018') + ';')}>{isRec ? '권고' : '수정'}</span>
+                              {(typeLabelMap[f.type] || '확인') + ' · “' + f.q + '”'}
+                            </div>
+                            <div style={css('font-size:12px; color:#5b6577; margin-top:2px; line-height:1.5;')}>{f.reason}</div>
+                          </div>
+                        );
+                      })}
                     </div>
-                  );
-                })}
+                  </div>
+                }
               </div>
             }
-            {!s.scanning && fullText && s.scanned && reviewSegments.length === 0 &&
-              <div style={css('display:flex; flex-direction:column; align-items:center; justify-content:center; height:200px; color:#0f7b4f; gap:8px; text-align:center;')}>
-                <div style={css('font-size:28px;')}>✅</div>
-                <div style={css('font-size:13.5px; font-weight:700; color:#0f7b4f;')}>권고·수정이 필요한 구간이 없습니다</div>
-                <div style={css('font-size:12px; color:#8a94a6;')}>시각 요소(이미지·제스처)는 아래 [2. 시각적 요소]에서 육안 확인하세요.</div>
-              </div>
-            }
-            {!s.scanning && (!fullText || !s.scanned) &&
+            {!s.scanning && !fullText &&
               <div style={css('display:flex; flex-direction:column; align-items:center; justify-content:center; height:200px; color:#aab2c0; gap:8px; text-align:center;')}>
                 <div style={css('font-size:26px;')}>🔍</div>
-                <div style={css('font-size:13px;')}>{s.aiError || '파일을 업로드하거나 본문·스크립트를 붙여넣고 [검증 시작]을 누르면 확인이 필요한 구간만 표기됩니다.'}</div>
+                <div style={css('font-size:13px;')}>{s.aiError || '파일을 업로드하거나 본문·스크립트를 붙여넣고 [검증 시작]을 누르면 전체 내용에서 권고·수정 구간이 색으로 표기됩니다.'}</div>
               </div>
             }
           </div>
